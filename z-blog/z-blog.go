@@ -14,14 +14,12 @@ import (
 	"time"
 )
 
-type ZBlog struct {
-	HomeURL       string // 主站 http://blog.isolezvoscombles.com/
-	BackstagePath string // 后台路径 zb_system/
-	LoginFile     string // 登录路径 cmd.php?act=verify
+func init() {
+	base.RegisterProgram("z-blog", Login)
 }
 
 type ZBlogSession struct {
-	zb           ZBlog
+	zb           base.ProgramBaseInfo
 	cookie       string
 	cookieValues []*http.Cookie
 	csrfS        string
@@ -36,7 +34,7 @@ var Client = &http.Client{
 }
 
 // Login 登录
-func (z ZBlog) Login(username, password string) (base.ProgramAPI, error) {
+func Login(username, password string, z base.ProgramBaseInfo) (base.ProgramAPI, error) {
 	param := url.Values{}
 	param.Set("edtUserName", username)
 	param.Set("edtPassWord", password)
@@ -44,7 +42,7 @@ func (z ZBlog) Login(username, password string) (base.ProgramAPI, error) {
 	param.Set("username", username)
 	param.Set("password", cgghui.MD5(password))
 	param.Set("savedate", "1")
-	req, err := http.NewRequest(http.MethodPost, z.HomeURL+z.BackstagePath+z.LoginFile, strings.NewReader(param.Encode()))
+	req, err := http.NewRequest(http.MethodPost, z.HomeURL+z.BackstagePath+z.LoginPath, strings.NewReader(param.Encode()))
 	req.Header.Add("User-Agent", base.UserAgent)
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	if err != nil {
@@ -116,6 +114,65 @@ func (s *ZBlogSession) ParamCSRF(uri, act string, params ...url.Values) string {
 	return uri + "?" + base.UrlQueryBuild(param)
 }
 
+var ErrOpenRewriteFail = errors.New("open rewrite fail")
+
+func (s *ZBlogSession) Init() error {
+	// open rewrite
+	param := url.Values{}
+	param.Set("name", "STACentre")
+	req, err := s.NewRequest(http.MethodGet, s.ParamCSRF("cmd.php", "PluginEnb", param), nil)
+	if err != nil {
+		return err
+	}
+	var resp *http.Response
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 302 {
+		return ErrOpenRewriteFail
+	}
+	//
+	param = url.Values{}
+	param.Set("install", "STACentre")
+	req, err = s.NewRequest(http.MethodGet, s.ParamCSRF("cmd.php", "PluginMng", param), nil)
+	if err != nil {
+		return err
+	}
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 302 {
+		return ErrOpenRewriteFail
+	}
+	//
+	param = url.Values{}
+	param.Set("csrfToken", s.GetCSRF())
+	param.Set("reset", "")
+	param.Set("ZC_STATIC_MODE", "REWRITE")
+	param.Set("ZC_ARTICLE_REGEX", "{%host%}post/{%id%}.html")
+	param.Set("ZC_PAGE_REGEX", "{%host%}{%id%}.html")
+	param.Set("ZC_INDEX_REGEX", "{%host%}page_{%page%}.html")
+	param.Set("ZC_CATEGORY_REGEX", "{%host%}category-{%id%}_{%page%}.html")
+	param.Set("ZC_TAGS_REGEX", "{%host%}tags-{%alias%}_{%page%}.html")
+	param.Set("radioZC_TAGS_REGEX", "{%host%}tags-{%alias%}_{%page%}.html")
+	param.Set("ZC_DATE_REGEX", "{%host%}date-{%date%}_{%page%}.html")
+	param.Set("ZC_AUTHOR_REGEX", "{%host%}date-{%date%}_{%page%}.html")
+	req, err = s.NewRequestHome(http.MethodPost, s.ParamCSRF("zb_users/plugin/STACentre/main.php", ""), param)
+	if err != nil {
+		return err
+	}
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 302 {
+		return ErrOpenRewriteFail
+	}
+	return nil
+}
+
 // ArticleNew 新建或修改文章
 func (s *ZBlogSession) ArticleNew(a *base.Article) error {
 	art := url.Values{}
@@ -152,6 +209,39 @@ func (s *ZBlogSession) ArticleNew(a *base.Article) error {
 		return nil
 	}
 	return base.ArticleNewErr
+}
+
+func (s *ZBlogSession) ArticleGet(a *base.Article) error {
+	art := url.Values{}
+	art.Add("category", "")
+	art.Add("status", "")
+	art.Add("search", a.Title)
+	req, err := s.NewRequestHome(http.MethodPost, s.ParamCSRF("zb_system/admin/index.php", "ArticleMng"), art)
+	if err != nil {
+		return err
+	}
+	var resp *http.Response
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	var doc *goquery.Document
+	if doc, err = goquery.NewDocumentFromReader(resp.Body); err != nil {
+		return err
+	}
+	doc.Find(".table_striped tr").EachWithBreak(func(i int, tr *goquery.Selection) bool {
+		if i == 0 {
+			return true
+		}
+		if strings.TrimSpace(tr.Find("td").Eq(3).Text()) == a.Title {
+			a.ID = tr.Find("td").Eq(0).Text()
+			return false
+		}
+		return true
+	})
+	return base.ArticleGetErr
 }
 
 // ArticleDel 删除文章
@@ -203,13 +293,29 @@ func (s *ZBlogSession) SiteSetting(ss *base.SiteSetting) error {
 // CategoryNew 新建或修改分类
 func (s *ZBlogSession) CategoryNew(c *base.Category) error {
 	cate := url.Values{}
-	cate.Add("ID", c.ID)
-	cate.Add("Type", c.Type)
+	if c.ID == "" {
+		cate.Add("ID", "0")
+	} else {
+		cate.Add("ID", c.ID)
+	}
+	if c.Type == "" {
+		cate.Add("Type", "0")
+	} else {
+		cate.Add("Type", c.Type)
+	}
 	cate.Add("Name", c.Name)
 	cate.Add("Alias", c.Alias)
 	cate.Add("Order", c.Order)
-	cate.Add("Template", c.Template)
-	cate.Add("LogTemplate", c.LogTemplate)
+	if c.Template == "" {
+		cate.Add("Template", "index")
+	} else {
+		cate.Add("Template", c.Template)
+	}
+	if c.LogTemplate == "" {
+		cate.Add("LogTemplate", "single")
+	} else {
+		cate.Add("LogTemplate", c.LogTemplate)
+	}
 	cate.Add("Intro", c.Intro)
 	cate.Add("AddNavbar", c.AddNavbar)
 	req, err := s.NewRequest(http.MethodPost, s.ParamCSRF("cmd.php", "CategoryPst"), cate)
@@ -227,6 +333,43 @@ func (s *ZBlogSession) CategoryNew(c *base.Category) error {
 		return nil
 	}
 	return base.CategoryNewErr
+}
+
+// CategoryGet 查找分类
+func (s *ZBlogSession) CategoryGet(c *base.Category) error {
+	req, err := s.NewRequestHome(http.MethodGet, s.ParamCSRF("zb_system/admin/index.php", "CategoryMng"), nil)
+	if err != nil {
+		return err
+	}
+	var resp *http.Response
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	var doc *goquery.Document
+	if doc, err = goquery.NewDocumentFromReader(resp.Body); err != nil {
+		return err
+	}
+	doc.Find(".tableBorder-thcenter tr").EachWithBreak(func(i int, tr *goquery.Selection) bool {
+		if i == 0 {
+			return true
+		}
+		name := strings.TrimSpace(tr.Find("td").Eq(2).Text())
+		if name == c.Name {
+			c.ID = strings.TrimSpace(tr.Find("td").Eq(0).Text())
+			c.Order = strings.TrimSpace(tr.Find("td").Eq(1).Text())
+			c.Alias = strings.TrimSpace(tr.Find("td").Eq(3).Text())
+
+			return false
+		}
+		return true
+	})
+	if c.ID != "" {
+		return nil
+	}
+	return base.CategoryGetErr
 }
 
 // CategoryDel 删除分类
@@ -255,7 +398,8 @@ func (s *ZBlogSession) CategoryDel(c *base.Category) error {
 
 var StatusCodeNot200Err = errors.New("status code not 200")
 
-func (s *ZBlogSession) NavbarGet() ([]*base.Navbar, error) {
+// NavbarList 导航
+func (s *ZBlogSession) NavbarList() ([]*base.Navbar, error) {
 	param := url.Values{}
 	param.Set("edit", "navbar")
 	req, err := s.NewRequestHome(http.MethodGet, s.ParamCSRF("zb_users/plugin/LinksManage/main.php", "", param), nil)
@@ -293,8 +437,9 @@ func (s *ZBlogSession) NavbarGet() ([]*base.Navbar, error) {
 	return data, nil
 }
 
+// NavbarNew 创建导航
 func (s *ZBlogSession) NavbarNew(n *base.Navbar) error {
-	navList, err := s.NavbarGet()
+	navList, err := s.NavbarList()
 	if err != nil {
 		navList = make([]*base.Navbar, 0)
 	}
@@ -340,6 +485,95 @@ func (s *ZBlogSession) NavbarNew(n *base.Navbar) error {
 		return nil
 	}
 	return base.NavbarNewErr
+}
+
+var duplicateTag = []byte("标签名称重复")
+
+func (s *ZBlogSession) TagNew(t *base.Tag) error {
+	param := url.Values{}
+	param.Set("ID", t.ID)
+	param.Set("Type", t.Type)
+	param.Set("Name", t.Name)
+	param.Set("Alias", t.Alias)
+	param.Set("Template", t.Template)
+	param.Set("Intro", t.Intro)
+	param.Set("AddNavbar", t.AddNavbar)
+	var req *http.Request
+	var err error
+	req, err = s.NewRequest(http.MethodPost, s.ParamCSRF("cmd.php", "TagPst"), param)
+	if err != nil {
+		return err
+	}
+	var resp *http.Response
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode == 302 {
+		return nil
+	}
+	if b, _ := ioutil.ReadAll(resp.Body); bytes.Contains(b, duplicateTag) {
+		return nil
+	}
+	return base.TagNewErr
+}
+
+func (s *ZBlogSession) TagGet(t *base.Tag) error {
+	param := url.Values{}
+	param.Set("search", t.Name)
+	var req *http.Request
+	var err error
+	req, err = s.NewRequestHome(http.MethodPost, s.ParamCSRF("zb_system/admin/index.php", "TagMng"), param)
+	if err != nil {
+		return err
+	}
+	var resp *http.Response
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	var doc *goquery.Document
+	if doc, err = goquery.NewDocumentFromReader(resp.Body); err != nil {
+		return err
+	}
+	tr := doc.Find(".table_striped tr")
+	if tr.Length() == 1 {
+		return base.TagUndefinedErr
+	}
+	td := tr.Eq(1).Find("td")
+	t.ID = td.Eq(0).Text()
+	t.Name = td.Eq(1).Text()
+	t.Alias = td.Eq(2).Text()
+	return nil
+}
+
+func (s *ZBlogSession) TagDel(t *base.Tag) error {
+	var err error
+	if err = s.TagGet(t); err != nil {
+		return err
+	}
+	param := url.Values{}
+	param.Set("id", t.ID)
+	var req *http.Request
+	req, err = s.NewRequest(http.MethodGet, s.ParamCSRF("cmd.php", "TagDel", param), nil)
+	if err != nil {
+		return err
+	}
+	var resp *http.Response
+	if resp, err = Client.Do(req); err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode == 302 {
+		return base.TagDelErr
+	}
+	return nil
 }
 
 func (s *ZBlogSession) NewRequestHome(method, uri string, param url.Values) (*http.Request, error) {
